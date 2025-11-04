@@ -1,0 +1,437 @@
+##04.model_specification
+#############################
+#Author: Veronica Malizia
+#Date: 29/10/2025
+#R version: 4.2.2
+# This is the main script containing the model's formulation and specifications
+# This script is called and launched from the "console script" 05_Run_model.R
+# It runs in parallel simulations using "doParallel" and "foreach" packages
+# The functions called within the script are stored in 01_Handy_functions.R
+#############################
+
+library(foreach)
+library(doParallel) 
+library(tidyverse)
+library(readxl)
+library(foreach)
+library(doParallel)
+library(parallelly)
+
+write.output <- TRUE 
+
+writeLines(c(""), "Sink.txt") #initiate log file
+
+cluster <- makeCluster(min(detectCores(logical = T), nrow(stoch_scenarios)))
+# line below only if library folder is different than default
+#clusterEvalQ(cluster, .libPaths(c("C:/Program Files/R/R-4.2.2/library",.libPaths())))
+registerDoParallel(cluster)
+
+results <- foreach(k = 1:nrow(stoch_scenarios),
+                   .inorder = TRUE,
+                   .errorhandling = "pass", #remove or pass
+                   .verbose = TRUE,
+                   #.combine = bind_rows, #default is a list
+                   .packages = c("tidyverse", "deSolve", "splitstackshape")) %dopar% {
+                     
+                     #set scenario-specific parameters
+                     scen <- stoch_scenarios[k, ]
+                     ind.output.dir <- file.path(source.dir, "Output", "Individual", setting)
+                     dir.create(ind.output.dir, recursive = TRUE, showWarnings = FALSE)
+                     
+                     parms$decay <- list(dec = scen$decay_rate)
+                     
+                     if (is.na(parms$decay$dec)) {
+                       warning(paste("Decay rate is NA in scenario", k))
+                       parms$decay$dec <- 0
+                     }
+                     
+                     #Load matched alphas for Density-dependent fecundity (DDF) given the endemicity
+                     load(paste("Matched_alphas_", scen$endem, ".RData", sep = ""))
+                     
+                     #Transmission parameters
+                     parms$parasite$zeta = scen$zeta #overall exposure rate.
+                     parms$parasite$k_w = scen$worms_aggr
+                     parms$snails$snail_transmission_rate = scen$tr_snails
+                     
+                     parms$parasite$ext.foi$value = scen$Ext_foi_value
+                     parms$parasite$ext.foi$duration = scen$Ext_foi_duration
+                     
+                     #Regulating mechanisms
+                     parms$immunity$imm = case_when(scen$imm_strength== "Absent" ~ 0,
+                                                    scen$imm_strength== "Mild" ~ 0.0005,
+                                                    scen$imm_strength== "Strong" ~ 0.002,
+                                                    scen$imm_strength== "Very Strong" ~ 0.008) 
+                     parms$snails$carrying.capacity = case_when(scen$snails == "Absent" ~ 1,
+                                                                scen$snails == "Mild" ~ 20000,
+                                                                scen$snails == "Strong" ~ 10000)
+                     parms$parasite$eggs$alpha = case_when(scen$DDF_strength== "Absent" ~ alpha_lin,
+                                                           scen$DDF_strength== "Mild" ~ alpha_mild,
+                                                           scen$DDF_strength== "Strong" ~ alpha_strong)
+                     parms$parasite$eggs$z = case_when(scen$DDF_strength== "Absent" ~ 0,
+                                                       scen$DDF_strength== "Mild" ~ 0.00022,
+                                                       scen$DDF_strength== "Strong" ~ 0.0007)
+                     
+                     
+                     sink("Sink.txt", append=TRUE)
+                     cat(paste(Sys.time(), ": Scenario nr.", k, "\n", sep = " "))
+                     sink()
+                     
+                     #for each seed:
+                     
+                     #profvis({   
+                     #Time step events, for each individual
+                     #Initialize population
+                     pop <- init$humans$pop 
+                     pop$cum_dwp <- 0
+                     #N <- nrow(pop)
+                     N <- numeric(12*T)
+                     ever_lived <- numeric(12*T)
+                     #ever_lived <- N
+                     SAC <- init$humans$SAC
+                     
+                     true_prev <- c(0)
+                     eggs_prev <- c(0)
+                     eggs_prev_SAC <- c(0)
+                     Heggs_prev <- c(0)
+                     Heggs_prev_SAC <- c(0)
+                     avg_geom_intensity <- c(0)
+                     avg_geom_intensity_SAC <- c(0)
+                     avg_intensity <- c(0)
+                     avg_intensity_SAC <- c(0)
+                     inf_snail <- init$snails$I0
+                     susc_snail <- init$snails$S0
+                     exp_snail <- init$snails$E0
+                     
+                     #Create initial cloud
+                     #Initialize quantities
+                     m_in <- numeric(12*T)
+                     m_in <- sum(init$environment$contributions0)
+                     ## Start values
+                     newstart <- c(init$snails$S0, init$snails$E0, init$snails$I0, init$snails$C0) 
+                     cercariae <- 0 #to eventually plot the cercariae (cloud)
+                     ind_file <- c()
+                     for(t in 2:(12*T)){
+                       
+                       ###########################################
+                       #Demography
+                       ###########################################
+                       
+                       #Beginning of each month, update demography
+                       ########## AGING
+                       pop$age = pop$age + 1/12
+                       
+                       ########## BIRTHS
+                       # (births and migration: deterministic processed -> fixed rate)
+                       #for now birth rate does not depend on age-specific female fertility
+                       births <- round(parms$demography$birth_rate*(nrow(pop)/1000)/12)
+                       #new born
+                       
+                       pop <- bind_rows(pop, 
+                                        data.frame(age=0,
+                                                   sex=as.numeric(rbernoulli(births, 0.5)),
+                                                   jw1 = 0,
+                                                   Ind_sus = rgamma(births, shape = parms$parasite$k_w, scale = 1/parms$parasite$k_w),
+                                                   complier = as.numeric(rbernoulli(births, 1-parms$mda$fr_excluded)),
+                                                   ID = c((ever_lived+1):(ever_lived+births)),
+                                                   death_age = 100,
+                                                   age_group = 1,
+                                                   rate = 0,
+                                                   wp1 = 0,
+                                                   wp2 = 0,
+                                                   wp3 = 0,
+                                                   jw2 = 0,
+                                                   jw3 = 0,
+                                                   cum_dwp = 0,
+                                                   mu = 0,
+                                                   ec = 0))
+                       ever_lived <- ever_lived+births
+                       
+                       ########## DEATHS
+                       if(t %in% seq(1, (T*12), 12)){ #Januaries
+                         ag <- as.numeric(cut(pop$age, c(-1, prob_death$Age_hi)))
+                         pop <- mutate(pop, age_group = ag)
+                         
+                         deaths <- as.tibble(table(ag)) %>%
+                           rename(Ag = ag) %>%
+                           mutate(n.deaths = round(prob_death[Ag, "Both_sexes"]*n)) %>%
+                           filter(n.deaths > 0)
+                         names(deaths$n.deaths) <- deaths$Ag
+                         
+                         # if(length(which(deaths$n.alive==0))>0) #we already remove the age group where nobody is left (if any)
+                         #   pop <- filter(pop, age_group != deaths$Ag[deaths$n.alive==0])
+                         
+                         deads <- stratified(pop[pop$age_group %in% deaths$Ag, ], "age_group", 
+                                             deaths$n.deaths, keep.rownames = T) %>%
+                           mutate(death_age = age + runif(n(), 1, 12)/12) 
+                         pop[deads$rn,"death_age"] <- deads$death_age 
+                       }
+                       
+                       pop <- filter(pop, age < death_age)
+                       
+                       ########## MIGRATION
+                       #For now we do not account for age-specific emigration. We only select an eligible age group (5-55)
+                       lambda <- round(parms$demography$emig_rate*(nrow(pop)/1000)/12)
+                       emigrated <- sample(which(pop$age>5&pop$age<55), lambda)
+                       if(length(emigrated)>0)
+                         pop <- pop[-emigrated,]
+                       
+                       ########## UPDATE population size, SAC vector, and cumulative exposure
+                       N[t] <- nrow(pop)
+                       SAC <- which(pop$age >= 5 & pop$age <= 15)
+                       
+                       #Relative exposure
+                       if(exposure=="ICL")
+                         rel_exp <- Age_profile_exp(parms$exposure$ICL_derived$ages,
+                                                    parms$exposure$ICL_derived$exp,
+                                                    pop$age,
+                                                    parms$exposure$ICL_derived$method)
+                       if(exposure=="Sow")
+                         rel_exp <- Age_profile_exp(parms$exposure$Sow_derived$ages,
+                                                    parms$exposure$Sow_derived$exp,
+                                                    pop$age,
+                                                    parms$exposure$Sow_derived$method)
+                       
+                       cum_exp <- sum(rel_exp$y*pop$Ind_sus) #Cumulative exposure
+                       
+                       ###########################################
+                       #Parasitology (vectorised)
+                       ###########################################
+                       
+                       # Apply decay to immunity before adding new killed worms
+                       pop$cum_dwp <- pop$cum_dwp * (1 - parms$decay$dec)
+                       
+                       ########### 1. CONTROL (MDA: 75% coverage, annual to target population)
+                       # If MDA occurs, it is scheduled at the beginning of the month
+                       killed_worms1 <- 0
+                       killed_worms2 <- 0
+                       killed_worms3 <- 0
+                       if(t %in% c(12*seq(parms$mda$start, parms$mda$end, parms$mda$frequency))){
+                         target <- which(pop$age >= parms$mda$age.lo & pop$age <= parms$mda$age.hi)
+                         compliers <- which(pop$age >= parms$mda$age.lo & pop$age <= parms$mda$age.hi & pop$complier==1)
+                         fr_compliers <- sum(pop$complier[target])/length(target)
+                         real_coverage <- parms$mda$coverage/fr_compliers
+                         treated <- sample(compliers, real_coverage*length(compliers)) #index of individuals
+                         n_treated <- length(treated)
+                         #Killing of worms in the three age baskets:
+                         killed_worms1 <- rbinom(n_treated, size = pop$wp1[treated], prob = parms$mda$efficacy)
+                         killed_worms2 <- rbinom(n_treated, size = pop$wp2[treated], prob = parms$mda$efficacy)
+                         killed_worms3 <- rbinom(n_treated, size = pop$wp3[treated], prob = parms$mda$efficacy)
+                         pop$wp1[treated] = pop$wp1[treated] - killed_worms1
+                         pop$wp2[treated] = pop$wp2[treated] - killed_worms2
+                         pop$wp3[treated] = pop$wp3[treated] - killed_worms3
+                         pop$cum_dwp[treated] = pop$cum_dwp[treated] + 
+                           killed_worms1 + killed_worms2 + killed_worms3
+                       }
+                       
+                       ########### 2. EGGS production (before updating worms)
+                       #Worms' pairs (so mature at stage 4) produce eggs
+                       #Can be improved with introduction of insemination probability
+                       
+                       #'mu' represents the expected egg load in a stool sample (41.7mg)
+                       #'eggs' is the daily egg amount passed to the environment
+                       # 24 is the Kato-Katz conversion factor from egg counts to epg, because (stool x day) is expressed in grams
+                       Tot_wp <- pop$wp1+pop$wp2+pop$wp3
+                       
+                       pop$mu <- parms$parasite$eggs$alpha*Tot_wp*expon_reduction(parms$parasite$eggs$z, w=Tot_wp) 
+                       
+                       eggs <- round(pop$mu*24*parms$parasite$eggs$gr_stool) #daily quantity, since particles in the environment are short-lived
+                       
+                       ########## 3. DIAGNOSIS 
+                       # 'ec' represents the egg counts detected with a simulated Kato-Katz test. Random draw from a Negative Binomial distribution
+                       if (parms$parasite$eggs$n.slides == 1)        
+                         pop$ec = rnbinom(nrow(pop), size=parms$parasite$eggs$k_e, mu=pop$mu)  
+                       
+                       if (parms$parasite$eggs$n.slides == 2) {
+                         ec1 = rnbinom(nrow(pop), size=parms$parasite$eggs$k_e, mu=pop$mu) 
+                         ec2 = rnbinom(nrow(pop), size=parms$parasite$eggs$k_e, mu=pop$mu) 
+                         avg.ec = apply(cbind(ec1,ec2), 1, mean) #take the mean between the two slides per person
+                         pop$ec = avg.ec 
+                       }
+                       
+                       ########## 4. CONTRIBUTION to the environment
+                       #Individual contributions
+                       #Eggs are passed to the intestine and released in the environment
+                       # TIP: this part can be improved with a delay in eggs' excretion
+                       
+                       #This is commented in this version of SchiSTOP, as we assume that contribution is not dependent on age
+                       #but the feature can be turned on by the user
+                       #pop$co <- round(eggs * Age_profile_contr(pop$age)$y)
+                       
+                       ########## 5. LIFE IN THE ENVIRONMENTAL RESERVOIR
+                       #Miracidiae intake at step t by the reservoir
+                       m_in[t] <- sum(eggs)
+                       
+                       if(scen$snails == "Absent")
+                         cercariae[t] <- m_in[t-1] 
+                       
+                       if(scen$snails != "Absent"){
+                         #Run snails ODEs model
+                         #in the final reservoir we have the total output of cercariae
+                         #we assume particles not infecting humans do not survive from the previous month
+                         
+                         #Call parameters and initial conditions
+                         #SEI-system runs at daily time step
+                         mirac.input = m_in[t-1] #miracidial input
+                         
+                         #for details about the parameters see 02_Parameters_Smansoni.R
+                         parms.ODE  <- c(beta0 = parms$snails$max.reproduction.rate, 
+                                         k = parms$snails$carrying.capacity, 
+                                         v = parms$snails$mortality.rate,
+                                         mir = mirac.input, 
+                                         b = parms$snails$snail_transmission_rate,
+                                         v2 = parms$snails$mortality.rate.infection, 
+                                         tau = parms$snails$infection.rate,
+                                         lambda = parms$snails$cerc.prod.rate, 
+                                         m = parms$snails$cerc.mortality)
+                         
+                         #Set initial conditions from the last day of previous run/month
+                         ## Start values for steady state
+                         xstart <- c(S = newstart[1], E = newstart[2], I = newstart[3], C = newstart[4])
+                         
+                         ## vector of time steps (30 days)
+                         times <- 1:30
+                         
+                         #Run and solve
+                         out <-  lsoda(xstart, times, SEI, parms.ODE, atol = 1e-4, rtol = 1e-4) 
+                         
+                         ## Translate the output into a data.frame
+                         out2 <- as.data.frame(out)
+                         
+                         # Use tail for NA safety
+                         last_S <- tail(out2$S, 1)
+                         last_E <- tail(out2$E, 1)
+                         last_I <- tail(out2$I, 1)
+                         last_C <- tail(out2$C, 1)
+                         
+                         # Build newstart vector
+                         newstart <- numeric(4)
+                         newstart[1] <- if (!is.na(last_S)) last_S else 0
+                         newstart[2] <- if (!is.na(last_E) && last_E < 1e-10) 0 else if (!is.na(last_E)) last_E else 0
+                         newstart[3] <- if (!is.na(last_I) && last_I < 1e-10) 0 else if (!is.na(last_I)) last_I else 0
+                         newstart[4] <- if (!is.na(last_C) && last_C < 1e-10) 0 else if (!is.na(last_C)) last_C else 0
+                         
+                         # Safe cercarial assignment
+                         cercariae[t] <- newstart[4]
+                    
+                       }
+                       
+                       ########## 6. EXPOSURE OF HUMANS 
+                       #Each individual acquires new worms (FOIh) and anti-reinfection immunity here applies
+                       #One exposure rate per individual (based on age and individual susceptibility)
+                       pop$rate = FOIh(l=cercariae[t], zeta=parms$parasite$zeta, rel_exp=rel_exp, is=pop$Ind_sus)*expon_reduction(parms$immunity$imm, pop$cum_dwp)/cum_exp
+                       #pop$rate <- pop$rate*logistic(k=imm, w0=w0_imm, w = pop$cum_dwp)
+                       
+                       ########## 7. SAVE OUTPUT
+                       
+                       #Summary statistics for population-level output 
+                       tot_worms <- pop$jw1+ pop$jw2 + pop$jw3 + pop$wp1 + pop$wp2 + pop$wp3
+                       true_prev[t] <- length(which(tot_worms>0))/nrow(pop)
+                       eggs_prev[t] <- length(which(pop$ec>0))/nrow(pop)
+                       Heggs_prev[t] <- length(which((pop$ec*24)>=400))/nrow(pop)
+                       eggs_prev_SAC[t] <- length(which(pop$ec[SAC]>0))/length(SAC)
+                       Heggs_prev_SAC[t] <- length(which((pop$ec[SAC]*24)>=400))/length(SAC)
+                       avg_geom_intensity[t] <- geom_mean(pop$ec+1)-1
+                       avg_geom_intensity_SAC[t] <- geom_mean(pop$ec[SAC]+1)-1
+                       avg_intensity[t] <- mean(pop$ec)
+                       avg_intensity_SAC[t] <- mean(pop$ec[SAC])
+                       if(scen$snails != "Absent"){
+                         inf_snail[t] <- out2$I[nrow(out2)] 
+                         susc_snail[t] <- out2$S[nrow(out2)]
+                         exp_snail[t] <- out2$E[nrow(out2)]
+                       }
+                       
+                       #Save annual individual-level output
+                       if(write.output == TRUE){
+                         #if(t %in% seq(12, (T*12), fr*12) & t > 500){ #Decembers, every 10 years
+                         if(t %% 12 == 0){  # Every December
+                           
+                           ind_file <- rbind(ind_file,
+                                             select(pop, ID, age, age_group, rate, wp1, wp2, wp3, ec, mu, cum_dwp) %>%
+                                               mutate(tot_wp = wp1+wp2+wp3,
+                                                      time = t/12, #years
+                                                      seed = scen$seed,
+                                                      Endemicity = scen$endem,
+                                                      zeta = scen$zeta,
+                                                      worms_aggr = scen$worms_aggr,
+                                                      tr_snails = scen$tr_snails,
+                                                      Immunity = scen$imm_strength,
+                                                      Snails = scen$snails,
+                                                      DDF = scen$DDF_strength,
+                                                      decay_strength = scen$decay_strength))
+                         }
+                       }
+                       
+                       ########## 8. WORMS UPDATE (for next monthly time step)
+                       
+                       ###Juveniles worms
+                       #Juvenile worms at stage 3 do pair and move to stage 4. The ones who don't, do not survive.
+                       #per each human host, juvenile worms at stage 3 are assigned with sex
+                       malesnw <- rbinom(nrow(pop), pop$jw3, 0.5)
+                       new_pairs <- pmin(malesnw, pop$jw3) 
+                       
+                       pop$jw3 = pop$jw2 
+                       pop$jw2 = pop$jw1 
+                       
+                       #First stage juveniles (new acquired)
+                       pop$jw1 = rpois(nrow(pop), pop$rate) 
+                       if(t <= parms$parasite$ext.foi$duration*12)
+                         pop$jw1 = pop$jw1 + round(parms$parasite$ext.foi$value*pop$Ind_sus)
+                       
+                       ### Adults worm pairs
+                       # Aging of worms: Erlang distributed lifespans
+                       # Three baskets: wp1, wp2, wp3, three aging groups
+                       aging_1 <- rbinom(nrow(pop), pop$wp1, parms$parasite$phi)
+                       aging_2 <- rbinom(nrow(pop), pop$wp2, parms$parasite$phi)
+                       aging_3 <- rbinom(nrow(pop), pop$wp3, parms$parasite$phi) 
+                       
+                       pop$wp1 = pop$wp1 + new_pairs - aging_1
+                       pop$wp2 = pop$wp2 + aging_1 - aging_2
+                       pop$wp3 = pop$wp3 + aging_2 - aging_3
+                       
+                       # Cumulated death worm pairs
+                       pop$cum_dwp = pop$cum_dwp + aging_3
+                     }
+                     
+                     if(write.output==TRUE){
+                       filename <- paste("Ind_out_seed_", scen$seed,
+                                         "_", scen$endem,
+                                         "_Imm=", scen$imm_strength,
+                                         "_Sn=", scen$snails,
+                                         "_DDF=", scen$DDF_strength,
+                                         "_Decay=", scen$decay_strength, ".RDS", sep = "")
+                       
+                       
+                       #Write
+                       saveRDS(ind_file,
+                               file.path(ind.output.dir, filename))
+                     }
+                     
+                     res <- tibble(time = 1:(12*T),
+                                   seed = rep(scen$seed, (12*T)),
+                                   Endemicity = rep(scen$endem, (12*T)),
+                                   zeta = rep(scen$zeta, (12*T)),
+                                   worms_aggr = rep(scen$worms_aggr, (12*T)),
+                                   tr_snails = rep(scen$tr_snails, (12*T)),
+                                   Immunity = rep(scen$imm_strength, (12*T)),
+                                   Snails = rep(scen$snails, (12*T)),
+                                   DDF= rep(scen$DDF_strength, (12*T)),
+                                   decay_strength = rep(scen$decay_strength, 12*T), 
+                                   pop_size = N,
+                                   miracidiae = m_in, 
+                                   cercariae = cercariae,
+                                   true_prev = true_prev,
+                                   eggs_prev = eggs_prev,
+                                   eggs_prev_SAC = eggs_prev_SAC,
+                                   Heggs_prev = Heggs_prev,
+                                   Heggs_prev_SAC = Heggs_prev_SAC,
+                                   avg_geom_intensity = avg_geom_intensity,
+                                   avg_geom_intensity_SAC = avg_geom_intensity_SAC,
+                                   avg_intensity = avg_intensity,
+                                   avg_intensity_SAC = avg_intensity_SAC,
+                                   inf_snail = inf_snail,
+                                   susc_snail = susc_snail,
+                                   exp_snail = exp_snail)
+                     #})
+                   } 
+
+stopCluster(cluster)
